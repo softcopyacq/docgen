@@ -48,7 +48,7 @@ with st.sidebar:
     st.write("3. View results below")
     
     st.markdown("---")
-    st.markdown("[GitHub](https://github.com/yourusername/docgen) | [Video Demo](#)")
+    st.markdown("[GitHub](https://github.com/softcopyacq/docgen) | [Video Demo](#)")
 
 # Main content
 col1, col2 = st.columns([1, 1])
