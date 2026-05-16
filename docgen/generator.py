@@ -145,7 +145,7 @@ def _mock_response(prompt: str) -> str:
 
 # ─── Main generator ──────────────────────────────────────────────────────────
 
-@dataclass_like := lambda **kw: type("Docs", (), kw)  # lightweight namespace
+dataclass_like = lambda **kw: type("Docs", (), kw)
 
 def generate_docs(modules: List[ModuleInfo], project_name: str = "Project", verbose: bool = False) -> Dict[str, Any]:
     """
