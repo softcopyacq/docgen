@@ -26,7 +26,7 @@ jobs:
         env:
           BOB_API_KEY: ${{ secrets.BOB_API_KEY }}
         run: |
-          python main.py . --output ./docs --format all --project-name "${{ github.event.repository.name }}"
+          streamlit run main.py & . --output ./docs --format all --project-name "${{ github.event.repository.name }}"
 
       - name: Commit generated docs
         uses: stefanzweifel/git-auto-commit-action@v5
