@@ -1,0 +1,312 @@
+{
+  "name": "DocGen — Subscription Payment & CRM Automation",
+  "nodes": [
+
+    {
+      "id": "node_webhook_trigger",
+      "name": "Stripe Webhook — Subscription Events",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [160, 300],
+      "parameters": {
+        "path": "docgen-subscription-payment",
+        "responseMode": "responseNode",
+        "httpMethod": "POST",
+        "authentication": "headerAuth",
+        "options": {
+          "allowedOrigins": "https://api.stripe.com"
+        }
+      },
+      "notes": "Receives Stripe webhook events: invoice.paid, invoice.payment_failed, customer.subscription.trial_will_end, customer.subscription.deleted"
+    },
+
+    {
+      "id": "node_respond_200",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [380, 200],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{ \"received\": true }",
+        "options": { "responseCode": 200 }
+      }
+    },
+
+    {
+      "id": "node_format_payment",
+      "name": "Format Payment Data",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [380, 380],
+      "parameters": {
+        "functionCode": "// Extract and normalise Stripe event data for DocGen\nconst event       = $input.first().json;\nconst eventType   = event.type;\nconst dataObj     = event.data?.object || {};\n\n// Determine event category\nconst isPaid      = eventType === 'invoice.paid';\nconst isFailed    = eventType === 'invoice.payment_failed';\nconst isTrialEnd  = eventType === 'customer.subscription.trial_will_end';\nconst isCancelled = eventType === 'customer.subscription.deleted';\n\n// Plan mapping\nconst PLAN_MAP = {\n  'price_starter_29':  { name: 'Starter',  price: 29,  docs: 50  },\n  'price_pro_79':      { name: 'Pro',       price: 79,  docs: 500 },\n  'price_team_199':    { name: 'Team',      price: 199, docs: 9999 },\n};\n\nconst priceId   = dataObj.lines?.data?.[0]?.price?.id || dataObj.plan?.id || 'price_pro_79';\nconst planInfo  = PLAN_MAP[priceId] || { name: 'Pro', price: 79, docs: 500 };\n\nconst amountRaw = dataObj.amount_paid || dataObj.amount_due || dataObj.plan?.amount || 0;\nconst amount    = (amountRaw / 100).toFixed(2);\nconst tax       = (parseFloat(amount) * 0.10).toFixed(2);\nconst total     = (parseFloat(amount) + parseFloat(tax)).toFixed(2);\n\nconst trialEnd  = dataObj.trial_end\n  ? new Date(dataObj.trial_end * 1000).toLocaleDateString('en-US', { year:'numeric', month:'long', day:'numeric' })\n  : null;\n\nconst now = new Date();\nconst invoiceDate = now.toLocaleDateString('en-US', { year:'numeric', month:'long', day:'numeric' });\nconst invoiceNum  = `INV-${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${Math.floor(Math.random()*9000+1000)}`;\n\nreturn [{\n  json: {\n    // Event metadata\n    eventType,\n    isPaid,\n    isFailed,\n    isTrialEnd,\n    isCancelled,\n    status: isPaid ? 'success' : isFailed ? 'failed' : isTrialEnd ? 'trial_ending' : 'cancelled',\n\n    // Customer\n    customerId:     dataObj.customer,\n    customerEmail:  dataObj.customer_email || dataObj.billing_details?.email || 'customer@email.com',\n    customerName:   dataObj.customer_name  || dataObj.billing_details?.name  || 'DocGen User',\n\n    // Subscription\n    subscriptionId: dataObj.subscription || dataObj.id,\n    planName:       planInfo.name,\n    planDocs:       planInfo.docs,\n    priceId,\n\n    // Payment\n    amount,\n    tax,\n    total,\n    currency:       (dataObj.currency || 'usd').toUpperCase(),\n    paymentMethod:  dataObj.payment_intent || 'card',\n\n    // Invoice\n    invoiceId:      dataObj.id || invoiceNum,\n    invoiceNumber:  invoiceNum,\n    invoiceDate,\n    trialEnd,\n\n    // DocGen-specific\n    productName:    `DocGen ${planInfo.name} Plan`,\n    appUrl:         'https://docgen-q5j9d8vgam8vxnksgjkg4d.streamlit.app',\n    repoUrl:        'https://github.com/softcopyacq/docgen',\n  }\n}];"
+      }
+    },
+
+    {
+      "id": "node_route_event",
+      "name": "Route by Event Type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [620, 380],
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json.status }}",
+        "rules": {
+          "rules": [
+            { "value2": "success",       "output": 0 },
+            { "value2": "failed",        "output": 1 },
+            { "value2": "trial_ending",  "output": 2 },
+            { "value2": "cancelled",     "output": 3 }
+          ]
+        },
+        "fallbackOutput": 0
+      }
+    },
+
+    {
+      "id": "node_hubspot_update",
+      "name": "HubSpot — Update CRM Record",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 2,
+      "position": [880, 240],
+      "parameters": {
+        "resource": "contact",
+        "operation": "upsert",
+        "email": "={{ $json.customerEmail }}",
+        "additionalFields": {
+          "properties": [
+            { "property": "firstname",           "value": "={{ $json.customerName.split(' ')[0] }}" },
+            { "property": "lastname",            "value": "={{ $json.customerName.split(' ').slice(1).join(' ') }}" },
+            { "property": "docgen_plan",         "value": "={{ $json.planName }}" },
+            { "property": "docgen_status",       "value": "={{ $json.status }}" },
+            { "property": "last_payment_date",   "value": "={{ $json.invoiceDate }}" },
+            { "property": "last_payment_amount", "value": "={{ $json.total }}" },
+            { "property": "subscription_id",     "value": "={{ $json.subscriptionId }}" },
+            { "property": "payment_status",      "value": "={{ $json.isPaid ? 'paid' : $json.isFailed ? 'failed' : 'active' }}" },
+            { "property": "trial_end_date",      "value": "={{ $json.trialEnd }}" },
+            { "property": "docgen_invoice_num",  "value": "={{ $json.invoiceNumber }}" },
+            { "property": "docgen_app_url",      "value": "={{ $json.appUrl }}" }
+          ]
+        }
+      }
+    },
+
+    {
+      "id": "node_generate_invoice",
+      "name": "Generate Invoice PDF",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [880, 380],
+      "parameters": {
+        "functionCode": "// Build invoice HTML for PDF generation\nconst d = $input.first().json;\n\nconst invoiceHtml = `\n<!DOCTYPE html>\n<html>\n<head>\n  <meta charset='UTF-8'>\n  <style>\n    body { font-family: Georgia, serif; margin: 0; padding: 40px; color: #111; }\n    .header { display: flex; justify-content: space-between; border-bottom: 3px solid #534AB7; padding-bottom: 20px; margin-bottom: 24px; }\n    .brand { font-size: 32px; font-weight: 900; color: #534AB7; letter-spacing: -0.02em; }\n    .brand-sub { font-size: 12px; color: #888; margin-top: 4px; }\n    .inv-title { font-size: 24px; font-weight: 700; }\n    .inv-num { font-size: 13px; color: #555; }\n    .paid-badge { display: inline-block; background: #1D9E7522; border: 1px solid #1D9E75; border-radius: 20px; padding: 3px 14px; font-size: 11px; font-weight: 700; color: #1D9E75; margin-top: 8px; }\n    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 24px; }\n    .label { font-size: 10px; font-weight: 700; color: #888; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }\n    table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }\n    th { background: #F5F4FF; padding: 8px 12px; text-align: left; font-size: 11px; font-weight: 700; color: #534AB7; text-transform: uppercase; letter-spacing: 0.06em; border-bottom: 1px solid #DDD; }\n    td { padding: 12px; font-size: 13px; border-bottom: 1px solid #EEE; }\n    .totals { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; border-top: 2px solid #EEE; padding-top: 16px; }\n    .total-row { display: flex; gap: 80px; font-size: 13px; }\n    .grand { font-size: 16px; font-weight: 800; color: #534AB7; border-top: 2px solid #534AB7; padding-top: 10px; }\n    .notice { margin-top: 24px; padding: 12px 16px; background: #F5F4FF; border-left: 3px solid #534AB7; border-radius: 8px; font-size: 12px; color: #555; }\n    .footer { margin-top: 20px; text-align: center; font-size: 11px; color: #AAA; border-top: 1px solid #EEE; padding-top: 16px; }\n  </style>\n</head>\n<body>\n  <div class='header'>\n    <div>\n      <div class='brand'>DocGen</div>\n      <div class='brand-sub'>AI-Powered Documentation Platform · IBM Bob Hackathon 2026</div>\n      <div class='brand-sub'>github.com/softcopyacq/docgen</div>\n    </div>\n    <div style='text-align:right'>\n      <div class='inv-title'>INVOICE</div>\n      <div class='inv-num'>#${d.invoiceNumber}</div>\n      <div class='paid-badge'>${d.isPaid ? '● PAID' : d.isFailed ? '⚠ PAYMENT FAILED' : '● ACTIVE'}</div>\n    </div>\n  </div>\n\n  <div class='grid'>\n    <div>\n      <div class='label'>Bill To</div>\n      <div style='font-weight:700;font-size:15px'>${d.customerName}</div>\n      <div style='font-size:13px;color:#555'>${d.customerEmail}</div>\n    </div>\n    <div>\n      <div class='label'>Invoice Details</div>\n      <div style='font-size:13px'><b>Date:</b> ${d.invoiceDate}</div>\n      <div style='font-size:13px'><b>Invoice #:</b> ${d.invoiceNumber}</div>\n      <div style='font-size:13px'><b>Subscription:</b> ${d.subscriptionId}</div>\n    </div>\n  </div>\n\n  <table>\n    <tr>\n      <th>Description</th><th>Qty</th><th>Unit Price</th><th>Amount</th>\n    </tr>\n    <tr>\n      <td><b>${d.productName}</b><br><span style='color:#888;font-size:11px'>Monthly subscription · IBM Bob AI · ${d.planDocs === 9999 ? 'Unlimited' : d.planDocs} docs/month</span></td>\n      <td>1</td>\n      <td>$${d.amount} ${d.currency}</td>\n      <td>$${d.amount} ${d.currency}</td>\n    </tr>\n  </table>\n\n  <div class='totals'>\n    <div class='total-row'><span style='color:#888'>Subtotal</span><span>$${d.amount}</span></div>\n    <div class='total-row'><span style='color:#888'>Tax (10%)</span><span>$${d.tax}</span></div>\n    <div class='total-row grand'><span>Total</span><span>$${d.total} ${d.currency}</span></div>\n  </div>\n\n  <div class='notice'>\n    <b>${d.isTrialEnd ? 'Trial Ending Soon:' : d.isPaid ? 'Payment Confirmed:' : 'Payment Notice:'}</b>\n    ${d.isPaid ? `Payment of $${d.total} received successfully. Thank you for using DocGen!` :\n      d.isFailed ? `Payment of $${d.total} failed. Please update your payment method at ${d.appUrl}` :\n      d.isTrialEnd ? `Your 3-day free trial ends on ${d.trialEnd}. You will be charged $${d.total} unless cancelled.` :\n      `Your subscription has been cancelled. No further charges will be applied.`}\n  </div>\n\n  <div class='footer'>\n    DocGen · support@docgen.ai · ${d.appUrl} · github.com/softcopyacq/docgen\n  </div>\n</body>\n</html>`;\n\nreturn [{ json: { ...d, invoiceHtml, invoiceReady: true } }];"
+      }
+    },
+
+    {
+      "id": "node_email_success",
+      "name": "Email — Payment Success",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [1140, 200],
+      "parameters": {
+        "fromEmail": "billing@docgen.ai",
+        "toEmail": "={{ $json.customerEmail }}",
+        "subject": "✅ DocGen — Payment Confirmed · Invoice {{ $json.invoiceNumber }}",
+        "emailFormat": "html",
+        "html": "<div style=\"font-family:Georgia,serif;max-width:560px;margin:0 auto;padding:32px;background:#F5F4FF;border-radius:12px\"><div style=\"font-size:28px;font-weight:900;color:#534AB7;margin-bottom:4px\">DocGen</div><div style=\"font-size:13px;color:#888;margin-bottom:24px\">AI-Powered Documentation Platform</div><h2 style=\"color:#1D9E75;margin:0 0 16px\">✅ Payment Confirmed!</h2><p style=\"font-size:15px;color:#333\">Hi <strong>{{ $json.customerName }}</strong>,</p><p style=\"font-size:14px;color:#444\">Thank you for your payment of <strong>${{ $json.total }} {{ $json.currency }}</strong> for the <strong>DocGen {{ $json.planName }} Plan</strong>.</p><div style=\"background:#fff;border:1px solid #DDD;border-radius:8px;padding:16px;margin:16px 0\"><div style=\"font-size:13px;margin-bottom:6px\"><b>Invoice:</b> {{ $json.invoiceNumber }}</div><div style=\"font-size:13px;margin-bottom:6px\"><b>Date:</b> {{ $json.invoiceDate }}</div><div style=\"font-size:13px;margin-bottom:6px\"><b>Amount:</b> ${{ $json.total }} {{ $json.currency }}</div><div style=\"font-size:13px\"><b>Subscription:</b> {{ $json.subscriptionId }}</div></div><a href=\"{{ $json.appUrl }}\" style=\"display:inline-block;background:#534AB7;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px;margin-top:8px\">Open DocGen →</a><p style=\"font-size:12px;color:#888;margin-top:24px\">Questions? Reply to this email or visit <a href=\"{{ $json.appUrl }}\">{{ $json.appUrl }}</a></p></div>",
+        "options": {}
+      }
+    },
+
+    {
+      "id": "node_email_failed",
+      "name": "Email — Payment Failed",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [1140, 340],
+      "parameters": {
+        "fromEmail": "billing@docgen.ai",
+        "toEmail": "={{ $json.customerEmail }}",
+        "subject": "⚠️ DocGen — Payment Failed · Action Required",
+        "emailFormat": "html",
+        "html": "<div style=\"font-family:Georgia,serif;max-width:560px;margin:0 auto;padding:32px;background:#FFF5F5;border-radius:12px\"><div style=\"font-size:28px;font-weight:900;color:#534AB7;margin-bottom:24px\">DocGen</div><h2 style=\"color:#E03B3B;margin:0 0 16px\">⚠️ Payment Failed</h2><p style=\"font-size:15px;color:#333\">Hi <strong>{{ $json.customerName }}</strong>,</p><p style=\"font-size:14px;color:#444\">We were unable to process your payment of <strong>${{ $json.total }} {{ $json.currency }}</strong> for <strong>DocGen {{ $json.planName }}</strong>.</p><p style=\"font-size:14px;color:#444\">Please update your payment method to keep your DocGen access active.</p><a href=\"{{ $json.appUrl }}\" style=\"display:inline-block;background:#E03B3B;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px;margin:16px 0\">Update Payment Method →</a><p style=\"font-size:12px;color:#888;margin-top:16px\">If you need help, reply to this email. Invoice ref: {{ $json.invoiceNumber }}</p></div>",
+        "options": {}
+      }
+    },
+
+    {
+      "id": "node_email_trial",
+      "name": "Email — Trial Ending (Day 3)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [1140, 480],
+      "parameters": {
+        "fromEmail": "billing@docgen.ai",
+        "toEmail": "={{ $json.customerEmail }}",
+        "subject": "⏰ Your DocGen Free Trial Ends Tomorrow — {{ $json.trialEnd }}",
+        "emailFormat": "html",
+        "html": "<div style=\"font-family:Georgia,serif;max-width:560px;margin:0 auto;padding:32px;background:#F5F4FF;border-radius:12px\"><div style=\"font-size:28px;font-weight:900;color:#534AB7;margin-bottom:24px\">DocGen</div><h2 style=\"color:#FFB830;margin:0 0 16px\">⏰ Trial Ending Soon</h2><p style=\"font-size:15px;color:#333\">Hi <strong>{{ $json.customerName }}</strong>,</p><p style=\"font-size:14px;color:#444\">Your 3-day free trial ends on <strong>{{ $json.trialEnd }}</strong>. After that, your <strong>DocGen {{ $json.planName }} Plan</strong> will continue at <strong>${{ $json.total }}/month</strong>.</p><p style=\"font-size:14px;color:#444\">No action needed if you want to keep your subscription. To cancel, visit your dashboard before the trial ends.</p><a href=\"{{ $json.appUrl }}\" style=\"display:inline-block;background:#534AB7;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px;margin-top:8px\">Manage Subscription →</a></div>",
+        "options": {}
+      }
+    },
+
+    {
+      "id": "node_slack_finance",
+      "name": "Slack — Notify Finance Team",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1140, 620],
+      "parameters": {
+        "channel": "#finance-operations",
+        "text": "={{ $json.isPaid ? '✅' : $json.isFailed ? '❌' : $json.isTrialEnd ? '⏰' : '🚫' }} *DocGen Subscription Update*\n\n*Customer:* {{ $json.customerName }} ({{ $json.customerEmail }})\n*Plan:* {{ $json.planName }} — ${{ $json.total }} {{ $json.currency }}/month\n*Event:* {{ $json.eventType }}\n*Status:* {{ $json.status.toUpperCase() }}\n*Invoice:* {{ $json.invoiceNumber }}\n*Subscription ID:* {{ $json.subscriptionId }}\n*Date:* {{ $json.invoiceDate }}\n{{ $json.trialEnd ? '*Trial Ends:* ' + $json.trialEnd : '' }}\n\n<{{ $json.appUrl }}|Open DocGen App> | <https://github.com/softcopyacq/docgen|GitHub Repo>",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      }
+    },
+
+    {
+      "id": "node_hubspot_deal",
+      "name": "HubSpot — Create/Update Deal",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 2,
+      "position": [1380, 300],
+      "parameters": {
+        "resource": "deal",
+        "operation": "upsert",
+        "additionalFields": {
+          "properties": [
+            { "property": "dealname",    "value": "DocGen {{ $json.planName }} — {{ $json.customerName }}" },
+            { "property": "amount",      "value": "={{ $json.total }}" },
+            { "property": "dealstage",   "value": "={{ $json.isPaid ? 'closedwon' : $json.isFailed ? 'closedlost' : 'contractsent' }}" },
+            { "property": "pipeline",    "value": "default" },
+            { "property": "closedate",   "value": "={{ Date.now() }}" },
+            { "property": "description", "value": "DocGen {{ $json.planName }} subscription · Invoice {{ $json.invoiceNumber }} · via github.com/softcopyacq/docgen" }
+          ]
+        }
+      }
+    },
+
+    {
+      "id": "node_track_revenue",
+      "name": "Track MRR to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1380, 480],
+      "parameters": {
+        "operation": "append",
+        "documentId": "YOUR_GOOGLE_SHEET_ID",
+        "sheetName": "DocGen MRR",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Date":            "={{ $json.invoiceDate }}",
+            "Invoice":         "={{ $json.invoiceNumber }}",
+            "Customer":        "={{ $json.customerName }}",
+            "Email":           "={{ $json.customerEmail }}",
+            "Plan":            "={{ $json.planName }}",
+            "Amount":          "={{ $json.amount }}",
+            "Tax":             "={{ $json.tax }}",
+            "Total":           "={{ $json.total }}",
+            "Currency":        "={{ $json.currency }}",
+            "Status":          "={{ $json.status }}",
+            "Subscription ID": "={{ $json.subscriptionId }}",
+            "Event Type":      "={{ $json.eventType }}"
+          }
+        }
+      }
+    },
+
+    {
+      "id": "node_trial_scheduler",
+      "name": "Schedule Trial-End Reminder",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1380, 620],
+      "parameters": {
+        "functionCode": "// Log trial activation — in production, use n8n's Schedule node\n// or Stripe's trial_will_end webhook (fires 3 days before trial ends)\nconst d = $input.first().json;\n\nif (d.isTrialEnd) {\n  // Stripe already fires trial_will_end 3 days before end\n  // This node confirms the reminder was processed\n  console.log(`Trial ending reminder processed for: ${d.customerEmail}`);\n}\n\nreturn [{\n  json: {\n    ...d,\n    reminderScheduled: true,\n    reminderNote: `Trial-end reminder processed for ${d.customerEmail} on ${d.invoiceDate}`,\n  }\n}];"
+      }
+    }
+  ],
+
+  "connections": {
+    "Stripe Webhook — Subscription Events": {
+      "main": [[
+        { "node": "Respond 200 OK",         "type": "main", "index": 0 },
+        { "node": "Format Payment Data",    "type": "main", "index": 0 }
+      ]]
+    },
+    "Format Payment Data": {
+      "main": [[
+        { "node": "Route by Event Type",    "type": "main", "index": 0 }
+      ]]
+    },
+    "Route by Event Type": {
+      "main": [
+        [{ "node": "HubSpot — Update CRM Record", "type": "main", "index": 0 },
+         { "node": "Generate Invoice PDF",         "type": "main", "index": 0 },
+         { "node": "Email — Payment Success",      "type": "main", "index": 0 },
+         { "node": "Slack — Notify Finance Team",  "type": "main", "index": 0 }],
+        [{ "node": "HubSpot — Update CRM Record", "type": "main", "index": 0 },
+         { "node": "Email — Payment Failed",       "type": "main", "index": 0 },
+         { "node": "Slack — Notify Finance Team",  "type": "main", "index": 0 }],
+        [{ "node": "Email — Trial Ending (Day 3)", "type": "main", "index": 0 },
+         { "node": "Slack — Notify Finance Team",  "type": "main", "index": 0 },
+         { "node": "Schedule Trial-End Reminder",  "type": "main", "index": 0 }],
+        [{ "node": "HubSpot — Update CRM Record", "type": "main", "index": 0 },
+         { "node": "Slack — Notify Finance Team",  "type": "main", "index": 0 }]
+      ]
+    },
+    "HubSpot — Update CRM Record": {
+      "main": [[{ "node": "HubSpot — Create/Update Deal", "type": "main", "index": 0 }]]
+    },
+    "Generate Invoice PDF": {
+      "main": [[{ "node": "Track MRR to Google Sheets", "type": "main", "index": 0 }]]
+    }
+  },
+
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution":   "all",
+    "saveExecutionProgress":    true,
+    "timezone":                 "America/New_York",
+    "callerPolicy":             "workflowsFromSameOwner"
+  },
+
+  "meta": {
+    "instanceId":   "docgen-ibmbob-hackathon-2026",
+    "templateId":   "docgen-subscription-automation",
+    "version":      "1.0.0",
+    "author":       "Newbon Kiroso",
+    "repo":         "https://github.com/softcopyacq/docgen",
+    "app":          "https://docgen-q5j9d8vgam8vxnksgjkg4d.streamlit.app",
+    "description":  "DocGen subscription payment automation: Stripe webhooks → format data → route by event → HubSpot CRM → Invoice PDF → customer email → Slack finance team → Google Sheets MRR tracking"
+  },
+
+  "_docgen_setup": {
+    "stripe_webhooks_to_enable": [
+      "invoice.paid",
+      "invoice.payment_failed",
+      "customer.subscription.trial_will_end",
+      "customer.subscription.deleted",
+      "customer.subscription.created"
+    ],
+    "stripe_plans": {
+      "price_starter_29":  { "name": "Starter", "price_usd": 29,  "trial_days": 3 },
+      "price_pro_79":      { "name": "Pro",      "price_usd": 79,  "trial_days": 3 },
+      "price_team_199":    { "name": "Team",     "price_usd": 199, "trial_days": 3 }
+    },
+    "n8n_credentials_needed": [
+      "Stripe API (webhook secret + secret key)",
+      "HubSpot API key",
+      "Gmail / SMTP for email sending",
+      "Slack Bot Token (channel: #finance-operations)",
+      "Google Sheets OAuth2"
+    ],
+    "webhook_url_format": "https://YOUR_N8N_INSTANCE/webhook/docgen-subscription-payment",
+    "estimated_mrr_at_capacity": "$9,500/month (based on 120 Pro subscribers)"
+  }
+}
